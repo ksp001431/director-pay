@@ -9,13 +9,26 @@ Audit log entries: {key, value, section, quote, confidence}
 from typing import List, Dict, Tuple, Any
 import json
 import re
+import time
 from bs4 import BeautifulSoup
 
 from schema import Field
 
-# Cap on filing text we send to the model. ~400k chars ≈ 100k tokens, well
-# within Claude Sonnet's 200k context.
-MAX_FILING_CHARS = 400_000
+# Hard cap on filing text we send to the model. ~80k chars ≈ 20k tokens,
+# safely under Anthropic Tier 1's 30k tokens-per-minute limit when combined
+# with the schema prompt. Tier 3+ users could raise this for fewer truncations.
+MAX_FILING_CHARS = 80_000
+
+# Heuristic patterns for finding the director compensation section. Ordered
+# from most specific to most general — we use the first match.
+SECTION_HEADINGS = [
+    r"(?im)^\s*director\s+compensation(?:\s+for\s+fiscal\s+year)?\s*$",
+    r"(?im)^\s*non-?employee\s+director\s+compensation\s*$",
+    r"(?im)^\s*compensation\s+of\s+(?:our\s+)?(?:non-?employee\s+)?directors\s*$",
+    r"(?i)\bdirector\s+compensation\s+(?:table|program)",
+    r"(?i)\bnon-?employee\s+director\s+compensation\b",
+    r"(?i)\bcompensation\s+of\s+(?:our\s+)?directors\b",
+]
 
 SYSTEM_PROMPT = """You are a senior compensation analyst extracting NON-EMPLOYEE DIRECTOR compensation data from a SEC DEF 14A proxy statement (or 10-K/A Part III).
 
@@ -40,6 +53,23 @@ def html_to_text(html: str) -> str:
     return text.strip()
 
 
+def extract_director_comp_section(text: str, max_chars: int = MAX_FILING_CHARS) -> str:
+    """Find the director compensation section and return a window around it.
+
+    Strategy: locate the first heading match, take a window of max_chars starting
+    from ~5% before the heading (to capture context) extending forward.
+    Falls back to first max_chars of the document if no heading is found.
+    """
+    for pat in SECTION_HEADINGS:
+        m = re.search(pat, text)
+        if m:
+            start = max(0, m.start() - max_chars // 20)
+            end = min(len(text), start + max_chars)
+            return text[start:end]
+    # Fallback: return the first chunk
+    return text[:max_chars]
+
+
 def build_field_schema_block(fields: List[Field]) -> str:
     """Render the schema as a compact, grouped reference for the prompt."""
     by_block: Dict[str, List[Field]] = {}
@@ -58,10 +88,7 @@ def build_field_schema_block(fields: List[Field]) -> str:
 
 def build_user_prompt(fields: List[Field], filing_text: str, ticker: str, company: str) -> str:
     schema_block = build_field_schema_block(fields)
-    if len(filing_text) > MAX_FILING_CHARS:
-        filing_text = filing_text[:MAX_FILING_CHARS] + "\n[...truncated...]"
-
-    return f"""Extract non-employee director compensation data for {company} ({ticker}) from the filing below.
+    return f"""Extract non-employee director compensation data for {company} ({ticker}) from the filing excerpt below.
 
 Return a JSON object with this exact shape:
 {{
@@ -80,24 +107,34 @@ Include EVERY variable_key from the schema below, even if value is null.
 
 === SCHEMA (variable_key, format, definition) ==={schema_block}
 
-=== FILING TEXT ===
+=== FILING EXCERPT (director compensation section) ===
 {filing_text}
 """
 
 
 def call_claude(api_key: str, system: str, user: str, model: str = "claude-sonnet-4-5") -> str:
     import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model=model, max_tokens=16000, system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return msg.content[0].text
+    client = anthropic.Anthropic(api_key=api_key, max_retries=4)
+    # The SDK retries 429s automatically with backoff; we add an outer retry
+    # for the case where a single request exceeds per-minute budget.
+    last_err = None
+    for attempt in range(3):
+        try:
+            msg = client.messages.create(
+                model=model, max_tokens=16000, system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            return msg.content[0].text
+        except anthropic.RateLimitError as e:
+            last_err = e
+            wait = 60 * (attempt + 1)
+            time.sleep(wait)
+    raise last_err
 
 
 def call_openai(api_key: str, system: str, user: str, model: str = "gpt-4.1") -> str:
     from openai import OpenAI
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, max_retries=4)
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -107,7 +144,6 @@ def call_openai(api_key: str, system: str, user: str, model: str = "gpt-4.1") ->
 
 
 def parse_response(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    # Strip code fences if present
     raw = raw.strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\n?", "", raw)
@@ -135,8 +171,9 @@ def parse_response(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
 def extract_from_filing(fields: List[Field], filing_html: str, ticker: str, company: str,
                         provider: str, api_key: str,
                         model: str = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    text = html_to_text(filing_html)
-    user = build_user_prompt(fields, text, ticker, company)
+    full_text = html_to_text(filing_html)
+    section_text = extract_director_comp_section(full_text)
+    user = build_user_prompt(fields, section_text, ticker, company)
     if provider == "claude":
         raw = call_claude(api_key, SYSTEM_PROMPT, user, model or "claude-sonnet-4-5")
     elif provider == "openai":
